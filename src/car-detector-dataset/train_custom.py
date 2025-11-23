@@ -11,7 +11,7 @@ IMG_SIZE = (32, 32)
 BATCH_SIZE = 32
 EPOCHS = 50
 
-OUT_MODEL = Path("models/custom_dataset_cnn.keras")
+OUT_MODEL = Path("src/car-detector-dataset/models/custom_dataset_cnn.keras")
 
 def load_datasets():
     train_ds = keras.utils.image_dataset_from_directory(

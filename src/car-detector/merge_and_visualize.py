@@ -14,9 +14,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ORIG_IMG = "data/input/car.jpg"
-SELECTED_DIR = "output/selected"
-OUT_IMG = "output/merged_result.png"
+ORIG_IMG = "src/car-detector/data/input/car.jpg"
+SELECTED_DIR = "src/car-detector/output/selected"
+OUT_IMG = "src/car-detector/output/merged_result.png"
 
 # IoU (Intersection over Union) threshold: the smaller value, the easier it is to be merged
 IOU_THRESH = 0.35

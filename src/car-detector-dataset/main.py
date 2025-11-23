@@ -4,7 +4,7 @@
 from pathlib import Path
 import cv2, matplotlib.pyplot as plt
 
-img_path = Path("data/input/car.jpg")
+img_path = Path("src/car-detector-dataset/data/input/car.jpg")
 img = cv2.imread(str(img_path))
 
 H, W = img.shape[:2]

@@ -11,9 +11,9 @@ import cv2
 import numpy as np
 
 """ Config path """
-INPUT_IMG = "data/input/car.jpg"
-SELECTED_DIR = "output/selected"
-OUT_PATH = "output/vis_result.png"
+INPUT_IMG = "src/car-detector/data/input/car.jpg"
+SELECTED_DIR = "src/car-detector/output/selected"
+OUT_PATH = "src/car-detector/output/vis_result.png"
 
 name_re = re.compile(r"(\d+)-(\d+)_([\d]+)-(\d+)-(.+)\.png")
 

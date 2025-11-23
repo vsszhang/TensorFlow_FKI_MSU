@@ -33,7 +33,7 @@ def slide_coords(W, H, tw, th, ox, oy):
             x += tw
         y += th
 
-def split_and_save(input_path="data/input/car.jpg", out_dir="output/split"):
+def split_and_save(input_path="src/car-detector-dataset/data/input/car.jpg", out_dir="output/split"):
     print("TEST")
 
     # Defining output path, if not, create it

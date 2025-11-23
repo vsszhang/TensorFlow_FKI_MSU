@@ -43,4 +43,4 @@ if __name__ == "__main__":
     print(model.evaluate(x_test, y_test, verbose=2))
 
     Path("models").mkdir(exist_ok=True)
-    model.save("models/cifar10_cnn.keras")
+    model.save("src/car-detector-dataset/models/cifar10_cnn.keras")
