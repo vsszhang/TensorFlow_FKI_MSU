@@ -17,3 +17,10 @@ For example, run the project **car-detector's** script **main.py**.
 ```bash
 uv run --package car-detector src/car-detector/main.py
 ```
+
+## Create a new project 🏗️
+If u want to create a new project based the workspace. Just runing the following command.
+```bash
+uv init src/example
+```
+This command will help u create a standard uv project `example` in the directory `src/`. Of course, the uv scarford will add your project setting infomation into the file `pyproject.toml`.
