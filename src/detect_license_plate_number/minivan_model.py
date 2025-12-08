@@ -84,7 +84,7 @@ def train_model():
     print(f"[INFO] Save model successfuly, saving into: {OUT_PATH}")
 
 """ Load model """
-def load_minivan_model(path=f"{BASE}models/minivan_cnn.keras"):
+def load_minivan_model(path=f"{BASE}model/minivan_cnn.keras"):
     return keras.models.load_model(path)
 
 """ Predict patch (is 'minivan', 'random' or 'road')"""
@@ -105,7 +105,7 @@ def predict_patch(model, patch_bgr):
     patch = cv2.resize(patch_bgr, (128, 128))
 
     # transfer into `float` (CNN model required)
-    patch = patch.astype("float32") / 255.0
+    patch = patch.astype("float32") # Attention: Not /255 for avoiding repeating the normalization process
 
     # add batch dimension (1, 128, 128, 3) (CNN model required)
     patch = np.expand_dims(patch, axis=0)
