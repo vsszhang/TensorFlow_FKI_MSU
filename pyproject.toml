@@ -11,4 +11,5 @@ members = [
     "src/car-detector",
     "src/car-detector-dataset",
     "src/detect_license_plate_number",
+    "src/tanslator",
 ]
