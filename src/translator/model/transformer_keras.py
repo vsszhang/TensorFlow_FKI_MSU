@@ -172,7 +172,7 @@ class EncoderLayer(tf.keras.layers.Layer):
             seq_len (tf.Tensor): senquence length
 
         Returns:
-            tf.Tensor: tf Tensor subject
+            tf.Tensor: tf Tensor object
         """
         # Ensure boolean mask
         mask = tf.cast(padding_mask, tf.bool)
@@ -196,7 +196,7 @@ class EncoderLayer(tf.keras.layers.Layer):
             training (bool, optional): whether in training mode. Defaults to False.
 
         Returns:
-            tf.Tensor: tf Tensor subject
+            tf.Tensor: tf Tensor object
         """
         seq_len = tf.shape(x)[1]
 
@@ -222,3 +222,342 @@ class EncoderLayer(tf.keras.layers.Layer):
         x = self.ffn_norm(x + ffn_out)
 
         return x
+
+
+# 5) Decoder Layer (Masker SA + Cross-Attn)
+class DecoderLayer(tf.keras.layers.Layer):
+    """A single Transformer Decoder layer.
+
+    Structure (classic):
+        x -> Masked Self-Attention -> Dropput -> Add & Norm
+          -> Cross-Attention (enc <-> dec) -> Dropout -> Add & Norm
+          -> FFN -> Dropout -> Add & Norm
+
+    Masks:
+    - tgt_padding_mask: (batch, tgt_len) 1/True = real token, 0/False = padding
+    - src_padding_mask: (batch, src_len) 1/True = real token, 0/False = padding
+
+    For masked self-attention we need TWO constraints:
+    1) look-ahead (causal) mask: position i cannot see future tokens j>i
+    2) padding mask: queries do not attend to padding keys
+
+    Keras MultiHeadAttention expects `attention_mask` where True/1 means
+    "this key position is visible"
+
+    Shapes:
+        self-attn mask: (batch, tgt_len, tgt_len)
+        cross-attn mask: (batch, tgt_len, src_len)
+
+    Args:
+        tf (tf keras Layer): tf keras Layer object
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dropout: float,
+        name: str | None = None,
+    ):
+        super().__init__(name=name)
+
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"[INFO] d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+            )
+
+        # step 1: masked self-attention (decoder attends to itself)
+        self.self_attn = tf.keras.layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=dropout,
+            name="masked_self_attention",
+        )
+        self.self_attn_dropout = tf.keras.layers.Dropout(dropout)
+        self.self_attn_norm = tf.keras.layers.LayerNormalization(
+            epsilon=1e-6, name="self_attn_norm"
+        )
+
+        # step 2: cross-attention (decoder attends to encoder output)
+        self.cross_attn = tf.keras.layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=dropout,
+            name="cross_attention",
+        )
+        self.cross_attn_dropout = tf.keras.layers.Dropout(dropout)
+        self.cross_attn_norm = tf.keras.layers.LayerNormalization(
+            epsilon=1e-6, name="cross_attn_norm"
+        )
+
+        # step 3: FFN sub-block
+        self.ffn = FeedForwardNetwork(
+            d_model=d_model, d_ff=d_ff, dropout=dropout, name="ffn_block"
+        )
+        self.ffn_norm = tf.keras.layers.LayerNormalization(
+            epsilon=1e-6, name="ffn_norm"
+        )
+
+    @staticmethod
+    def _make_look_ahead_mask(tgt_len: tf.Tensor) -> tf.Tensor:
+        """Create causal mask of shape (tgt_len, tgt_len)
+
+        True means visible (allowed), False means masked.
+
+        Example (tgt_len=4):
+            [[1, 0, 0, 0],
+             [1, 1, 0, 0],
+             [1, 1, 1, 0],
+             [1, 1, 1, 1]]
+
+        Args:
+            tgt_len (tf.Tensor): tgt length
+
+        Returns:
+            tf.Tensor: tf Tensor object
+        """
+        mask = tf.linalg.band_part(tf.ones((tgt_len, tgt_len), dtype=tf.bool), -1, 0)
+        return mask
+
+    @staticmethod
+    def _make_self_attention_mask(
+        tgt_padding_mask: tf.Tensor | None, tgt_len: tf.Tensor
+    ) -> tf.Tensor:
+        """Combine lood-ahead + target padding mask into (batch, tgt_len, tgt_len).
+
+        Args:
+            tgt_padding_mask (tf.Tensor | None): tgt padding mask
+            tgt_len (tf.Tensor): tgt len
+
+        Returns:
+            tf.Tensor: tf Tensor object
+        """
+        # (tgt_len, tgt_len)
+        causal = DecoderLayer._make_look_ahead_mask(tgt_len)
+
+        # expand to (1, tgt_len, tgt_len) then brodcast to (batch, tgt_len, tgt_len)
+        causal = causal[tf.newaxis, :, :]
+
+        if tgt_padding_mask is None:
+            return causal
+
+        # tgt_padding_mask: (batch, tgt_len) where 1/True = real token
+        key_visible = tf.cast(tgt_padding_mask, tf.bool)  # (batch, tgt_len)
+        key_visible = key_visible[:, tf.newaxis, :]  # (batch, 1, tgt_len)
+        key_visible = tf.tile(key_visible, [1, tgt_len, 1])  # (batch, tgt_len, tgt_len)
+
+        # both constrains must be satisfied
+        return tf.logical_and(key_visible, causal)
+
+    @staticmethod
+    def _make_cross_attention_mask(
+        src_padding_mask: tf.Tensor | None, tgt_len: tf.Tensor
+    ) -> tf.Tensor | None:
+        if src_padding_mask is None:
+            return None
+
+        # 1/True means visible
+        mask = tf.cast(src_padding_mask, tf.bool)  # (batch, src_len)
+        mask = mask[:, tf.newaxis, :]  # (batch, 1, src_len)
+        return tf.tile(mask, [1, tgt_len, 1])  # (batch, tgt_len, src_len)
+
+    def call(
+        self,
+        x: tf.Tensor,
+        enc_out: tf.Tensor,
+        tgt_padding_mask: tf.Tensor | None = None,
+        src_padding_mask: tf.Tensor | None = None,
+        training: bool = False,
+    ) -> tf.Tensor:
+        tgt_len = tf.shape(x)[1]
+
+        # step 1: masked self-attention
+        self_mask = self._make_self_attention_mask(tgt_padding_mask, tgt_len)
+
+        attn1 = self.self_attn(
+            query=x, value=x, key=x, attention_mask=self_mask, training=training
+        )
+        attn1 = self.self_attn_dropout(attn1, training=training)
+        x = self.self_attn_norm(x + attn1)
+
+        # step 2: cross-attention: query=decoder states, key/value=encoder states
+        cross_mask = self._make_cross_attention_mask(src_padding_mask, tgt_len)
+        attn2 = self.cross_attn(
+            query=x,
+            value=enc_out,
+            key=enc_out,
+            attention_mask=cross_mask,
+            training=training,
+        )
+        attn2 = self.cross_attn_dropout(attn2, training=training)
+        x = self.cross_attn_norm(x + attn2)
+
+        # step 3: FFN
+        ffn_out = self.ffn(x, training=training)
+        x = self.ffn_norm(x + ffn_out)
+
+        return x
+
+
+# 6) Encoder / Decoder stacks (num_layers)
+class Encoder(tf.keras.layers.Layer):
+    def __init__(self, cfg: TransformerConfig, name: str | None = None):
+        super().__init__(name=name)
+        self.cfg = cfg
+
+        self.embed = PositionalEmbedding(
+            vocab_size=cfg.src_vocab_size,
+            d_model=cfg.d_model,
+            max_len=cfg.max_len,
+            dropout=cfg.dropout,
+            name="src_embedding",
+        )
+
+        self.layers = [
+            EncoderLayer(
+                d_model=cfg.d_model,
+                num_heads=cfg.num_heads,
+                d_ff=cfg.d_ff,
+                dropout=cfg.dropout,
+                name=f"encoder_layer_{i}",
+            )
+            for i in range(cfg.num_layers)
+        ]
+
+    def call(
+        self,
+        src_ids: tf.Tensor,
+        src_padding_mask: tf.Tensor | None = None,
+        training: bool = False,
+    ) -> tf.Tensor:
+        """_summary_
+
+        Args:
+            src_ids (tf.Tensor): (batch, src_len)
+            src_padding_mask (tf.Tensor | None, optional): (batch, src_len) with 1/True for real tokens. Defaults to None.
+            training (bool, optional): whether in training mode. Defaults to False.
+
+        Returns:
+            tf.Tensor: tf Tensor object
+        """
+        x = self.embed(src_ids, training=training)  # (batch, src_len, d_model)
+        for layer in self.layers:
+            x = layer(x, padding_mask=src_padding_mask, training=training)
+        return x
+
+
+class Decoder(tf.keras.layers.Layer):
+    def __init__(self, cfg: TransformerConfig, name: str | None = None):
+        super().__init__(name=name)
+        self.cfg = cfg
+
+        self.embed = PositionalEmbedding(
+            vocab_size=cfg.tgt_vocab_size,
+            d_model=cfg.d_model,
+            max_len=cfg.max_len,
+            dropout=cfg.dropout,
+            name="tgt_embedding",
+        )
+
+        self.layers = [
+            DecoderLayer(
+                d_model=cfg.d_model,
+                num_heads=cfg.num_heads,
+                d_ff=cfg.d_ff,
+                dropout=cfg.dropout,
+                name=f"decoder_layer_{i}",
+            )
+            for i in range(cfg.num_layers)
+        ]
+
+    def call(
+        self,
+        tgt_ids: tf.Tensor,
+        enc_out: tf.Tensor,
+        tgt_padding_mask: tf.Tensor | None = None,
+        src_padding_mask: tf.Tensor | None = None,
+        training: bool = False,
+    ) -> tf.Tensor:
+        """_summary_
+
+        Args:
+            tgt_ids (tf.Tensor): (batch, tgt_len)
+            enc_out (tf.Tensor): (batch, src_len, d_model)
+            tgt_padding_mask (tf.Tensor | None, optional): (batch, tgt_len) with 1/True for real tokens. Defaults to None.
+            src_padding_mask (tf.Tensor | None, optional): (batch, src_len) wiht 1/True for real tokens. Defaults to None.
+            training (bool, optional): whether in training model. Defaults to False.
+
+        Returns:
+            tf.Tensor: tf Tensor object
+        """
+        x = self.embed(tgt_ids, training=training)  # (batch, tgt_len, d_model)
+        for layer in self.layers:
+            x = layer(
+                x,
+                enc_out,
+                tgt_padding_mask=tgt_padding_mask,
+                src_padding_mask=src_padding_mask,
+                training=training,
+            )
+        return x
+
+
+# 7) Full Transformer model (compile/fit)
+class Transformer(tf.keras.Model):
+    def __init__(self, cfg: TransformerConfig, name: str | None = None):
+        super().__init__(name=name)
+        self.cfg = cfg
+
+        self.encoder = Encoder(cfg, name="encoder")
+        self.decoder = Decoder(cfg, name="decoder")
+
+        # final projection to vocabulary
+        self.out_proj = tf.keras.layers.Dense(cfg.tgt_vocab_size, name="vocab_logits")
+
+    @staticmethod
+    def make_padding_mask(token_ids: tf.Tensor, pad_id: int = 3) -> tf.Tensor:
+        """Create padding mask (batch, seq_len) where 1=real token, 0=pad
+
+        Set pad_id=3 to match SentencePiece config (--pad_id=3)
+
+        Args:
+            token_ids (tf.Tensor): toekn ids
+            pad_id (int, optional): _description_. Defaults to 3.
+
+        Returns:
+            tf.Tensor: tf Tensor object
+        """
+        return tf.cast(tf.not_equal(token_ids, pad_id), tf.int32)
+
+    def call(
+        self,
+        inputs: tuple[tf.Tensor, tf.Tensor],
+        training: bool = False,
+    ) -> tf.Tensor:
+        """Keras forward.
+
+        Args:
+            inputs (tuple[tf.Tensor, tf.Tensor]): (src_ids, tgt_in_i)
+            training (bool, optional): whether in training model. Defaults to False.
+
+        Returns:
+            tf.Tensor: logits (batch, tgt_len,  tgt_vocab_size)
+        """
+        src_ids, tgt_in_ids = inputs
+
+        src_padding_mask = self.make_padding_mask(src_ids)
+        tgt_padding_mask = self.make_padding_mask(tgt_in_ids)
+
+        enc_out = self.encoder(
+            src_ids, src_padding_mask=src_padding_mask, training=training
+        )
+        dec_out = self.decoder(
+            tgt_in_ids,
+            enc_out,
+            tgt_padding_mask=tgt_padding_mask,
+            src_padding_mask=src_padding_mask,
+            training=training,
+        )
+
+        return self.out_proj(dec_out)
