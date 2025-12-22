@@ -98,8 +98,20 @@ def export_parallel_from_csv(
                 skipped += 1
                 continue
 
-            ru = (row[ru_col] or "").strip()
-            en = (row[en_col] or "").strip()
+            # Robust parsing:
+            # - Corpus confirmed format: EN,RU... (RU may contain extra commas if unquoted)
+            # - We join the remaining columns as a single RU string.
+            if en_col == 0:
+                en = (row[0] or "").strip()
+                ru = ",".join(row[1:]).strip()
+            elif en_col == len(row) - 1:
+                # Rare fallback: EN is the last column
+                en = (row[-1] or "").strip()
+                ru = ",".join(row[:-1]).strip()
+            else:
+                # Generic fallback: take selected columns as-is
+                en = (row[en_col] or "").strip()
+                ru = (row[ru_col] or "").strip()
 
             if not ru or not en:
                 skipped += 1
@@ -184,6 +196,71 @@ def masked_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     return tf.reduce_sum(per_token) / tf.reduce_sum(mask)
 
 
+# 4.5) Train one direction and save a model
+def train_one(
+    *,
+    direction: str,
+    src_path: Path,
+    tgt_path: Path,
+    sp_src: spm.SentencePieceProcessor,
+    sp_tgt: spm.SentencePieceProcessor,
+    out_dir: Path,
+    save_name: str,
+    max_len: int = 64,
+    d_model: int = 256,
+    num_heads: int = 8,
+    d_ff: int = 512,
+    num_layers: int = 4,
+    dropout: float = 0.1,
+    batch_size: int = 64,
+    epochs: int = 1,
+    steps_per_epoch: int = 200,
+    learning_rate: float = 1e-4,
+) -> Path:
+    """Train a single seq2seq Transformer for one translation direction."""
+    print(f"\n[TRAIN] Direction: {direction}")
+
+    cfg = TransformerConfig(
+        src_vocab_size=sp_src.get_piece_size(),
+        tgt_vocab_size=sp_tgt.get_piece_size(),
+        max_len=max_len,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        dropout=dropout,
+    )
+
+    # NOTE: make_dataset() 参数名是 ru/en，但这里只是名字；传入 src/tgt 即可。
+    train_ds = make_dataset(
+        ru_path=src_path,
+        en_path=tgt_path,
+        sp_ru=sp_src,
+        sp_en=sp_tgt,
+        max_len=cfg.max_len,
+        batch_size=batch_size,
+        shuffle=True,
+    )
+
+    model = Transformer(cfg)
+
+    # build model weights (helps summary/save)
+    model.build(input_shape=[(None, cfg.max_len), (None, cfg.max_len - 1)])
+    model.summary()
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss=masked_loss,
+    )
+
+    model.fit(train_ds, epochs=epochs, steps_per_epoch=steps_per_epoch)
+
+    save_path = out_dir / save_name
+    model.save(str(save_path))
+    print(f"[OK] Saved model to: {save_path}")
+    return save_path
+
+
 # 5) Main training entry
 def main():
     base = Path(__file__).resolve().parent
@@ -195,7 +272,8 @@ def main():
     ru_train = data_dir / "train.ru"
     en_train = data_dir / "train.en"
 
-    # CSV is English,Russian, swap ru_col/en_col.
+    # CSV rows may be: EN,RU or EN,RU1 RU2 RU3 (and sometimes RU contains extra commas).
+    # minimal changes in the training pipeline.
     csv_corpus = base / "data" / "raw" / "en2ru.csv"
 
     if csv_corpus.exists():
@@ -203,11 +281,20 @@ def main():
             csv_corpus,
             ru_out=ru_train,
             en_out=en_train,
-            ru_col=0,
-            en_col=1,
+            ru_col=1,
+            en_col=0,
             encoding="utf-8",
         )
         print(f"[CSV] Exported parallel files: written={written}, skipped={skipped}")
+        # Sanity check: RU and EN heads should be different (RU vs EN)
+        print(
+            "[CSV] train.ru head:",
+            ru_train.read_text(encoding="utf-8").splitlines()[:3],
+        )
+        print(
+            "[CSV] train.en head:",
+            en_train.read_text(encoding="utf-8").splitlines()[:3],
+        )
     else:
         print(
             f"[CSV] Not found: {csv_corpus} (fallback to existing train.ru/train.en if present)"
@@ -216,47 +303,36 @@ def main():
     sp_ru = load_sp(tok_dir / "spm_ru_bpe_16k.model")
     sp_en = load_sp(tok_dir / "spm_en_bpe_16k.model")
 
-    # keep it small first
-    cfg = TransformerConfig(
-        src_vocab_size=sp_ru.get_piece_size(),
-        tgt_vocab_size=sp_en.get_piece_size(),
+    # Train two directions with minimal changes:
+    # 1) RU -> EN (src=RU, tgt=EN)
+    train_one(
+        direction="RU->EN",
+        src_path=ru_train,
+        tgt_path=en_train,
+        sp_src=sp_ru,
+        sp_tgt=sp_en,
+        out_dir=out_dir,
+        save_name="translator_ru_en.keras",
         max_len=64,
-        d_model=256,
-        num_heads=8,
-        d_ff=512,
-        num_layers=4,
-        dropout=0.1,
+        batch_size=64,
+        epochs=1,
+        steps_per_epoch=200,
     )
 
-    batch_size = 64
-
-    train_ds = make_dataset(
-        ru_path=ru_train,
-        en_path=en_train,
-        sp_ru=sp_ru,
-        sp_en=sp_en,
-        max_len=cfg.max_len,
-        batch_size=batch_size,
-        shuffle=True,
+    # 2) EN -> RU (src=EN, tgt=RU)
+    train_one(
+        direction="EN->RU",
+        src_path=en_train,
+        tgt_path=ru_train,
+        sp_src=sp_en,
+        sp_tgt=sp_ru,
+        out_dir=out_dir,
+        save_name="translator_en_ru.keras",
+        max_len=64,
+        batch_size=64,
+        epochs=1,
+        steps_per_epoch=200,
     )
-
-    model = Transformer(cfg)
-
-    # build model
-    model.build(input_shape=[(None, cfg.max_len), (None, cfg.max_len - 1)])
-    model.summary()
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss=masked_loss
-    )
-
-    # quick sanity run: 1 epoch
-    model.fit(train_ds, epochs=1, steps_per_epoch=200)
-
-    # save model
-    save_path = out_dir / "translator_ru_en.keras"
-    model.save(str(save_path))
-    print(f"[OK] Saved model to: {save_path}")
 
 
 if __name__ == "__main__":
