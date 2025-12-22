@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import tensorflow as tf
 
@@ -446,6 +446,11 @@ class Encoder(tf.keras.layers.Layer):
             x = layer(x, padding_mask=src_padding_mask, training=training)
         return x
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({"cfg": asdict(self.cfg)})
+        return config
+
 
 class Decoder(tf.keras.layers.Layer):
     def __init__(self, cfg: TransformerConfig, name: str | None = None):
@@ -501,6 +506,11 @@ class Decoder(tf.keras.layers.Layer):
                 training=training,
             )
         return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"cfg": asdict(self.cfg)})
+        return config
 
 
 # 7) Full Transformer model (compile/fit)
@@ -561,3 +571,15 @@ class Transformer(tf.keras.Model):
         )
 
         return self.out_proj(dec_out)
+
+    def get_config(self):
+        # Required for saving to the native `.keras` format when __init__ has non-primitive args.
+        config = super().get_config()
+        config.update({"cfg": asdict(self.cfg)})
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        cfg_dict = config.pop("cfg")
+        cfg = TransformerConfig(**cfg_dict)
+        return cls(cfg=cfg, **config)
