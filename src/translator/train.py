@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import sentencepiece as spm
@@ -56,7 +57,63 @@ def encode_line(sp: spm.SentencePieceProcessor, text, max_len: int) -> list[int]
     return ids
 
 
-# 3) Build tf.data. pipeline (RU -> EN)
+# 2.5) Build parallel text files from CSV
+def export_parallel_from_csv(
+    csv_path: Path,
+    ru_out: Path,
+    en_out: Path,
+    *,
+    ru_col: int = 0,
+    en_col: int = 1,
+    encoding: str = "utf-8",
+    max_rows: int | None = None,
+) -> tuple[int, int]:
+    """Read `csv_path` and export two parallel files: ru_out / en_out.
+
+    CSV format assumption (can be adjusted by ru_col/en_col):
+    - column `ru_col` -> Russian text
+    - column `en_col` -> English text
+
+    Returns:
+        (written_rows, skipped_rows)
+    """
+    ru_out.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    skipped = 0
+
+    with (
+        csv_path.open("r", encoding=encoding, newline="") as f_in,
+        ru_out.open("w", encoding="utf-8", newline="\n") as f_ru,
+        en_out.open("w", encoding="utf-8", newline="\n") as f_en,
+    ):
+        reader = csv.reader(f_in)
+
+        for row in reader:
+            if max_rows is not None and written >= max_rows:
+                break
+
+            # Basic validation
+            if not row or len(row) <= max(ru_col, en_col):
+                skipped += 1
+                continue
+
+            ru = (row[ru_col] or "").strip()
+            en = (row[en_col] or "").strip()
+
+            if not ru or not en:
+                skipped += 1
+                continue
+
+            # One sample per line
+            f_ru.write(ru + "\n")
+            f_en.write(en + "\n")
+            written += 1
+
+    return written, skipped
+
+
+# 3) Build tf.data pipeline (RU -> EN)
 def make_dataset(
     ru_path: Path,
     en_path: Path,
@@ -137,6 +194,24 @@ def main():
 
     ru_train = data_dir / "train.ru"
     en_train = data_dir / "train.en"
+
+    # CSV is English,Russian, swap ru_col/en_col.
+    csv_corpus = base / "data" / "raw" / "en2ru.csv"
+
+    if csv_corpus.exists():
+        written, skipped = export_parallel_from_csv(
+            csv_corpus,
+            ru_out=ru_train,
+            en_out=en_train,
+            ru_col=0,
+            en_col=1,
+            encoding="utf-8",
+        )
+        print(f"[CSV] Exported parallel files: written={written}, skipped={skipped}")
+    else:
+        print(
+            f"[CSV] Not found: {csv_corpus} (fallback to existing train.ru/train.en if present)"
+        )
 
     sp_ru = load_sp(tok_dir / "spm_ru_bpe_16k.model")
     sp_en = load_sp(tok_dir / "spm_en_bpe_16k.model")
